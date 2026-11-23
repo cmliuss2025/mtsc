@@ -28,7 +28,7 @@ on:
           - 'http_only (仅 HTTP 正向代理)'
           - 'https_only (仅 HTTPS CONNECT 代理)'
           - 'socks4_only (仅 SOCKS4)'
-        default: 'all (全协议: HTTP/HTTPS/SOCKS4/SOCKS5)'
+        default: 'https_only (仅 HTTPS CONNECT 代理)'
       dict_mode:
         description: '弱密码字典模式'
         required: false
@@ -66,7 +66,7 @@ on:
       custom_ports:
         description: '自定义端口 (支持单个端口、逗号分隔、或范围如 1-65535、8000-8080)'
         required: false
-        default: '1080'
+        default: '443'
       workers:
         description: '每台机器并发 Goroutine 数 (推荐 1000~2000)'
         required: false
