@@ -8,10 +8,11 @@ on:
         required: true
         type: choice
         options:
-          - '4 台机器 (默认稳妥，推荐 50 万以下)'
-          - '8 台机器 (极速并发，推荐 50 万以上)'
+          - '20 台机器 (满血分片并发，默认极速)'
+          - '8 台机器 (中速并发，推荐 50 万以上)'
+          - '4 台机器 (轻量稳妥，推荐 50 万以下)'
           - 'custom (使用下方自定义输入)'
-        default: '4 台机器 (默认稳妥，推荐 50 万以下)'
+        default: '20 台机器 (满血分片并发，默认极速)'
       custom_shards:
         description: '自定义分片机器数 (选 custom 时生效，范围 1~20)'
         required: false
@@ -42,11 +43,11 @@ on:
         required: false
         type: choice
         options:
-          - 'fast (默认精简: 优先免密 + 5 组核心高频弱密，共 6 组)'
+          - 'full (完整 330 组，默认全量爆破)'
+          - 'fast (精简高频: 优先免密 + 5 组核心高频弱密，共 6 组)'
           - 'extended (丰富扩展: 包含 25+ 组常用默认口令)'
-          - 'full (完整 329 组)'
           - 'none (仅免密探测: 不尝试任何弱口令)'
-        default: 'fast (默认精简: 优先免密 + 5 组核心高频弱密，共 6 组)'
+        default: 'full (完整 330 组，默认全量爆破)'
       fetch_online:
         description: '是否聚合全网公开代理源 (自动拉取数万个公开代理并入待测队列)'
         required: false
@@ -76,13 +77,13 @@ on:
         required: false
         default: '1080'
       workers:
-        description: '每台机器并发 Goroutine 数 (推荐 1000~3000)'
+        description: '每台机器并发 Goroutine 数 (默认 3000，兼顾速度与防风控)'
         required: false
         default: '3000'
       timeout:
-        description: '超时时间 (推荐 2s~3s 极速过滤)'
+        description: '超时时间 (默认 2s 极速防风控过滤)'
         required: false
-        default: '3s'
+        default: '2s'
       limit:
         description: '单台机器最大扫描数量 (0 为扫描全部)'
         required: false
@@ -108,25 +109,29 @@ jobs:
       - name: Calculate Shard Matrix
         id: calc-matrix
         env:
-          SHARDS_PRESET: ${{ github.event.inputs.shards_preset || '4' }}
+          SHARDS_PRESET: ${{ github.event.inputs.shards_preset || '20' }}
           CUSTOM_SHARDS: ${{ github.event.inputs.custom_shards || '20' }}
         run: |
           python3 - <<'EOF'
           import json
           import os
 
-          preset = os.getenv("SHARDS_PRESET", "4")
+          preset = os.getenv("SHARDS_PRESET", "20")
           custom = os.getenv("CUSTOM_SHARDS", "20")
 
-          if "8" in preset:
+          if "20" in preset:
+              shards = 20
+          elif "8" in preset:
               shards = 8
+          elif "4" in preset:
+              shards = 4
           elif "custom" in preset:
               try:
                   shards = int(custom)
               except ValueError:
                   shards = 20
           else:
-              shards = 4
+              shards = 20
 
           shards = max(1, min(20, shards))
 
@@ -420,14 +425,15 @@ jobs:
       - name: Run Multi-Protocol Shard Scanner
         env:
           RAW_PROTO: ${{ github.event.inputs.protocol || 'all' }}
-          RAW_DICT: ${{ github.event.inputs.dict_mode || 'fast' }}
+          RAW_DICT: ${{ github.event.inputs.dict_mode || 'full' }}
           IN_SHUFFLE: ${{ github.event.inputs.shuffle }}
           IN_WORKERS: ${{ github.event.inputs.workers || '3000' }}
-          IN_TIMEOUT: ${{ github.event.inputs.timeout || '3s' }}
+          IN_TIMEOUT: ${{ github.event.inputs.timeout || '2s' }}
           IN_LIMIT: ${{ github.event.inputs.limit || '0' }}
           SHARD_IDX: ${{ matrix.shard }}
           SHARD_TOT: ${{ needs.generate-matrix.outputs.total_shards }}
         run: |
+          ulimit -n 65535 2>/dev/null || true
           PROTO=$(echo "$RAW_PROTO" | awk '{print $1}')
           DICT=$(echo "$RAW_DICT" | awk '{print $1}')
           if [ "$IN_SHUFFLE" = "false" ]; then
@@ -440,7 +446,7 @@ jobs:
           LIMIT_NUM=$(echo "$IN_LIMIT" | tr -cd '0-9')
           [ -z "$LIMIT_NUM" ] && LIMIT_NUM=0
           TIMEOUT_CLEAN=$(echo "$IN_TIMEOUT" | tr -cd '0-9a-zA-Z.')
-          [ -z "$TIMEOUT_CLEAN" ] && TIMEOUT_CLEAN="3s"
+          [ -z "$TIMEOUT_CLEAN" ] && TIMEOUT_CLEAN="2s"
 
           go run multi_scan.go \
             -input ip_list.txt \
@@ -491,12 +497,12 @@ jobs:
         env:
           MY_PAT: ${{ secrets.MY_PAT }}
           PRIVATE_REPO: ${{ secrets.PRIVATE_REPO }}
-          IN_TIMEOUT: ${{ github.event.inputs.timeout || '3s' }}
+          IN_TIMEOUT: ${{ github.event.inputs.timeout || '2s' }}
           RAW_OUTPUT_MODE: ${{ github.event.inputs.output_mode || 'merge' }}
         run: |
           echo "[*] 开始汇总各分片扫描结果..."
           TIMEOUT_CLEAN=$(echo "$IN_TIMEOUT" | tr -cd '0-9a-zA-Z.')
-          [ -z "$TIMEOUT_CLEAN" ] && TIMEOUT_CLEAN="3s"
+          [ -z "$TIMEOUT_CLEAN" ] && TIMEOUT_CLEAN="2s"
           OUTPUT_MODE=$(echo "$RAW_OUTPUT_MODE" | awk '{print $1}' | tr '[:upper:]' '[:lower:]')
           [ -z "$OUTPUT_MODE" ] && OUTPUT_MODE="merge"
           echo "[*] 输出结果处理模式: $OUTPUT_MODE"
@@ -630,7 +636,7 @@ jobs:
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
           GIST_ID: ${{ secrets.GIST_ID || vars.GIST_ID }}
           RAW_PROTO: ${{ github.event.inputs.protocol || 'all' }}
-          RAW_DICT: ${{ github.event.inputs.dict_mode || 'fast' }}
+          RAW_DICT: ${{ github.event.inputs.dict_mode || 'full' }}
           SHARD_TOT: ${{ needs.generate-matrix.outputs.total_shards }}
           IN_WORKERS: ${{ github.event.inputs.workers || '3000' }}
           MATRIX_RESULT: ${{ needs.scan-matrix.result }}
@@ -786,7 +792,7 @@ jobs:
           if tg_token and tg_chat:
               print("[*] 正在发送 Telegram 机器人通知卡片...")
               proto_val = (os.getenv("RAW_PROTO", "all").split() or ["all"])[0]
-              dict_val = (os.getenv("RAW_DICT", "fast").split() or ["fast"])[0]
+              dict_val = (os.getenv("RAW_DICT", "full").split() or ["full"])[0]
               shards_val = os.getenv("SHARD_TOT", "1")
               workers_val = "".join(c for c in os.getenv("IN_WORKERS", "3000") if c.isdigit()) or "3000"
               matrix_res = os.getenv("MATRIX_RESULT", "success")
