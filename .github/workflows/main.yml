@@ -11,11 +11,19 @@ on:
           - '4 台机器 (默认稳妥，推荐 50 万以下)'
           - '8 台机器 (极速并发，推荐 50 万以上)'
           - 'custom (使用下方自定义输入)'
-        default: 'custom (使用下方自定义输入)'
+        default: '4 台机器 (默认稳妥，推荐 50 万以下)'
       custom_shards:
         description: '自定义分片机器数 (选 custom 时生效，范围 1~20)'
         required: false
         default: '20'
+      output_mode:
+        description: '输出结果保存模式'
+        required: false
+        type: choice
+        options:
+          - 'merge (合并去重: 保活复测历史池并与本次新发现合并)'
+          - 'overwrite (覆盖最新: 仅保留本次扫描新结果，丢弃历史存活池)'
+        default: 'merge (合并去重: 保活复测历史池并与本次新发现合并)'
       protocol:
         description: '探测协议模式'
         required: false
@@ -28,7 +36,7 @@ on:
           - 'http_only (仅 HTTP 正向代理)'
           - 'https_only (仅 HTTPS CONNECT 代理)'
           - 'socks4_only (仅 SOCKS4)'
-        default: 'https_only (仅 HTTPS CONNECT 代理)'
+        default: 'all (全协议: HTTP/HTTPS/SOCKS4/SOCKS5)'
       dict_mode:
         description: '弱密码字典模式'
         required: false
@@ -38,7 +46,7 @@ on:
           - 'extended (丰富扩展: 包含 25+ 组常用默认口令)'
           - 'full (完整 329 组)'
           - 'none (仅免密探测: 不尝试任何弱口令)'
-        default: 'full (完整 329 组)'
+        default: 'fast (默认精简: 优先免密 + 5 组核心高频弱密，共 6 组)'
       fetch_online:
         description: '是否聚合全网公开代理源 (自动拉取数万个公开代理并入待测队列)'
         required: false
@@ -62,13 +70,13 @@ on:
           - '1-10000 (常用前 10000 端口)'
           - '1-65535 (全端口 1~65535)'
           - 'custom (使用下方自定义端口，支持逗号或范围)'
-        default: 'custom (使用下方自定义端口，支持逗号或范围)'
+        default: 'auto (按探测协议智能匹配常规端口)'
       custom_ports:
         description: '自定义端口 (支持单个端口、逗号分隔、或范围如 1-65535、8000-8080)'
         required: false
-        default: '443'
+        default: '1080'
       workers:
-        description: '每台机器并发 Goroutine 数 (推荐 1000~2000)'
+        description: '每台机器并发 Goroutine 数 (推荐 1000~3000)'
         required: false
         default: '3000'
       timeout:
@@ -99,13 +107,16 @@ jobs:
     steps:
       - name: Calculate Shard Matrix
         id: calc-matrix
+        env:
+          SHARDS_PRESET: ${{ github.event.inputs.shards_preset || '4' }}
+          CUSTOM_SHARDS: ${{ github.event.inputs.custom_shards || '20' }}
         run: |
           python3 - <<'EOF'
           import json
           import os
 
-          preset = "${{ github.event.inputs.shards_preset || '4' }}"
-          custom = "${{ github.event.inputs.custom_shards || '4' }}"
+          preset = os.getenv("SHARDS_PRESET", "4")
+          custom = os.getenv("CUSTOM_SHARDS", "20")
 
           if "8" in preset:
               shards = 8
@@ -113,7 +124,7 @@ jobs:
               try:
                   shards = int(custom)
               except ValueError:
-                  shards = 4
+                  shards = 20
           else:
               shards = 4
 
@@ -216,6 +227,8 @@ jobs:
               print(f"[*] 正在为目标绑定端口: {ports}")
 
           total_written = 0
+          valid_rules = 0
+          skipped_rules = 0
           seen = set()
 
           with open(output_file, "w", encoding="utf-8") as fout:
@@ -225,12 +238,14 @@ jobs:
                           line = raw.strip()
                           if not line or line.startswith("#"):
                               continue
+                          if "#" in line:
+                              line = line.split("#", 1)[0].strip()
+                          if not line:
+                              continue
 
                           clean_target = line
                           if "://" in clean_target:
                               clean_target = clean_target.split("://", 1)[1]
-                          if "#" in clean_target:
-                              clean_target = clean_target.split("#", 1)[0].strip()
 
                           host_part = clean_target.split("@")[-1] if "@" in clean_target else clean_target
                           if ":" in host_part:
@@ -240,7 +255,7 @@ jobs:
                                       seen.add(line)
                                       fout.write(line + "\n")
                                       total_written += 1
-                                  print(f"✅ Line {line_num}: {line} (Direct target with port)")
+                                  valid_rules += 1
                                   continue
 
                           if "-" in line:
@@ -259,7 +274,8 @@ jobs:
 
                                       range_count = int(end_ip) - int(start_ip) + 1
                                       if range_count > 5000000:
-                                          print(f"⚠️ Line {line_num}: {line} → {range_count} IPs, skipping (too large, max 5,000,000)")
+                                          skipped_rules += 1
+                                          print(f"⚠️ Line {line_num}: {range_count} IPs, skipping (too large, max 5,000,000)")
                                           continue
 
                                       for int_ip in range(int(start_ip), int(end_ip) + 1):
@@ -271,10 +287,11 @@ jobs:
                                                   fout.write(target + "\n")
                                                   total_written += 1
 
-                                      print(f"✅ Line {line_num}: {line} (Range) → {range_count} IPs")
+                                      valid_rules += 1
                                       continue
-                                  except ValueError as e:
-                                      print(f"❌ Line {line_num}: '{line}' is invalid range — {e}", file=sys.stderr)
+                                  except ValueError:
+                                      skipped_rules += 1
+                                      print(f"❌ Line {line_num}: invalid IP range format", file=sys.stderr)
                                       continue
 
                           try:
@@ -282,7 +299,8 @@ jobs:
                               count = network.num_addresses
 
                               if count > 5000000:
-                                  print(f"⚠️ Line {line_num}: {line} → {count} addresses, skipping (too large, max 5,000,000)")
+                                  skipped_rules += 1
+                                  print(f"⚠️ Line {line_num}: {count} addresses, skipping (too large, max 5,000,000)")
                                   continue
 
                               if count == 1:
@@ -299,10 +317,13 @@ jobs:
                                           fout.write(target + "\n")
                                           total_written += 1
 
-                              print(f"✅ Line {line_num}: {line} (CIDR) → {count if count == 1 else count - 2} hosts")
+                              valid_rules += 1
 
-                          except ValueError as e:
-                              print(f"❌ Line {line_num}: '{line}' is invalid — {e}", file=sys.stderr)
+                          except ValueError:
+                              skipped_rules += 1
+                              print(f"❌ Line {line_num}: invalid IP/CIDR format", file=sys.stderr)
+
+                  print(f"[*] 规则解析完成 (已脱敏隐藏具体网段): 有效规则 {valid_rules} 条 | 超限/异常跳过 {skipped_rules} 条")
 
               fetch_online = os.getenv("FETCH_ONLINE", "false").lower() == "true"
               if fetch_online:
@@ -397,29 +418,42 @@ jobs:
           name: target-ip-list
 
       - name: Run Multi-Protocol Shard Scanner
+        env:
+          RAW_PROTO: ${{ github.event.inputs.protocol || 'all' }}
+          RAW_DICT: ${{ github.event.inputs.dict_mode || 'fast' }}
+          IN_SHUFFLE: ${{ github.event.inputs.shuffle }}
+          IN_WORKERS: ${{ github.event.inputs.workers || '3000' }}
+          IN_TIMEOUT: ${{ github.event.inputs.timeout || '3s' }}
+          IN_LIMIT: ${{ github.event.inputs.limit || '0' }}
+          SHARD_IDX: ${{ matrix.shard }}
+          SHARD_TOT: ${{ needs.generate-matrix.outputs.total_shards }}
         run: |
-          RAW_PROTO="${{ github.event.inputs.protocol || 'all' }}"
           PROTO=$(echo "$RAW_PROTO" | awk '{print $1}')
-          RAW_DICT="${{ github.event.inputs.dict_mode || 'fast' }}"
           DICT=$(echo "$RAW_DICT" | awk '{print $1}')
-          SHUFFLE_ARG=""
-          if [ "${{ github.event.inputs.shuffle }}" = "false" ]; then
+          if [ "$IN_SHUFFLE" = "false" ]; then
             SHUFFLE_ARG="-shuffle=false"
           else
             SHUFFLE_ARG="-shuffle=true"
           fi
+          WORKERS_NUM=$(echo "$IN_WORKERS" | tr -cd '0-9')
+          [ -z "$WORKERS_NUM" ] && WORKERS_NUM=3000
+          LIMIT_NUM=$(echo "$IN_LIMIT" | tr -cd '0-9')
+          [ -z "$LIMIT_NUM" ] && LIMIT_NUM=0
+          TIMEOUT_CLEAN=$(echo "$IN_TIMEOUT" | tr -cd '0-9a-zA-Z.')
+          [ -z "$TIMEOUT_CLEAN" ] && TIMEOUT_CLEAN="3s"
 
           go run multi_scan.go \
             -input ip_list.txt \
-            -output "results_${{ matrix.shard }}.txt" \
-            -shard-index ${{ matrix.shard }} \
-            -shard-total ${{ needs.generate-matrix.outputs.total_shards }} \
+            -output "results_${SHARD_IDX}.txt" \
+            -shard-index "$SHARD_IDX" \
+            -shard-total "$SHARD_TOT" \
             -proto "$PROTO" \
             -dict "$DICT" \
-            $SHUFFLE_ARG \
-            -workers ${{ github.event.inputs.workers || '1000' }} \
-            -timeout ${{ github.event.inputs.timeout || '3s' }} \
-            -limit ${{ github.event.inputs.limit || '0' }}
+            -silent \
+            "$SHUFFLE_ARG" \
+            -workers "$WORKERS_NUM" \
+            -timeout "$TIMEOUT_CLEAN" \
+            -limit "$LIMIT_NUM"
 
       - name: Upload shard result
         uses: actions/upload-artifact@v4
@@ -438,99 +472,394 @@ jobs:
         uses: actions/checkout@v4
         continue-on-error: true
 
+      - name: Setup Go
+        if: needs.scan-matrix.result != 'cancelled' && needs.scan-matrix.result != 'skipped'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+
       - name: Download all shard artifacts
+        if: needs.scan-matrix.result != 'cancelled' && needs.scan-matrix.result != 'skipped'
+        continue-on-error: true
         uses: actions/download-artifact@v4
         with:
           path: shards
 
-      - name: Merge, deduplicate and split by protocol
-        id: merge
-        env:
-          RAW_PROTO: ${{ github.event.inputs.protocol || 'all' }}
-        run: |
-          echo "[*] 开始汇总所有分片结果..."
-          mkdir -p temp_merge
-          find shards -type f -name "results_*.txt" -exec cat {} + > temp_merge/raw_all.txt
-
-          TOTAL_LINES=$(grep -v '^\s*$' temp_merge/raw_all.txt 2>/dev/null | wc -l || echo 0)
-          echo "[*] 本次扫描各分片收集到的存活记录数: $TOTAL_LINES"
-
-          grep '^http://' temp_merge/raw_all.txt 2>/dev/null | sort -u > temp_merge/new_http.txt || true
-          grep '^https://' temp_merge/raw_all.txt 2>/dev/null | sort -u > temp_merge/new_https.txt || true
-          grep '^socks5://' temp_merge/raw_all.txt 2>/dev/null | sort -u > temp_merge/new_socks5.txt || true
-          grep '^socks4://' temp_merge/raw_all.txt 2>/dev/null | sort -u > temp_merge/new_socks4.txt || true
-
-          if [ "$TOTAL_LINES" -gt 0 ]; then
-            cp temp_merge/raw_all.txt all_results.txt
-            cp temp_merge/new_http.txt http_results.txt
-            cp temp_merge/new_https.txt https_results.txt
-            cp temp_merge/new_socks5.txt socks5_results.txt
-            cp temp_merge/new_socks4.txt socks4_results.txt
-            echo "has_alive=true" >> $GITHUB_OUTPUT
-            echo "count=$TOTAL_LINES" >> $GITHUB_OUTPUT
-          else
-            echo "has_alive=false" >> $GITHUB_OUTPUT
-            echo "count=0" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Get current date
-        id: date
-        run: |
-          echo "date=$(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_OUTPUT
-
-      - name: Push results back (Private Repo or Local)
-        if: steps.merge.outputs.has_alive == 'true'
+      - name: Recheck historical pool, merge, deduplicate and push
+        if: needs.scan-matrix.result != 'cancelled' && needs.scan-matrix.result != 'skipped'
         env:
           MY_PAT: ${{ secrets.MY_PAT }}
           PRIVATE_REPO: ${{ secrets.PRIVATE_REPO }}
+          IN_TIMEOUT: ${{ github.event.inputs.timeout || '3s' }}
+          RAW_OUTPUT_MODE: ${{ github.event.inputs.output_mode || 'merge' }}
         run: |
+          echo "[*] 开始汇总各分片扫描结果..."
+          TIMEOUT_CLEAN=$(echo "$IN_TIMEOUT" | tr -cd '0-9a-zA-Z.')
+          [ -z "$TIMEOUT_CLEAN" ] && TIMEOUT_CLEAN="3s"
+          OUTPUT_MODE=$(echo "$RAW_OUTPUT_MODE" | awk '{print $1}' | tr '[:upper:]' '[:lower:]')
+          [ -z "$OUTPUT_MODE" ] && OUTPUT_MODE="merge"
+          echo "[*] 输出结果处理模式: $OUTPUT_MODE"
+
+          mkdir -p temp_merge
+          : > temp_merge/raw_all.txt
+          if [ -d "shards" ]; then
+            find shards -type f -name "results_*.txt" -exec cat {} + >> temp_merge/raw_all.txt 2>/dev/null || true
+          fi
+          grep -v '^\s*$' temp_merge/raw_all.txt | sort -u > temp_merge/new_alive.txt || : > temp_merge/new_alive.txt
+          NEW_COUNT=$(wc -l < temp_merge/new_alive.txt | tr -d ' ')
+          echo "[*] 本次分片新发现存活代理数 (去重后): $NEW_COUNT"
+
+          CROSS_REPO="false"
+          WORK_REPO="."
+          SCANNER_SRC="./multi_scan.go"
+
           if [ -n "$MY_PAT" ] && [ -n "$PRIVATE_REPO" ]; then
-            echo "[*] 跨仓模式：正在将存活结果推回私有仓库 ${PRIVATE_REPO}..."
+            CROSS_REPO="true"
+            echo "[*] 跨仓模式：正在同步私有仓库以复测历史代理池..."
             git clone "https://${MY_PAT}@github.com/${PRIVATE_REPO}.git" target_repo
-
-            for f in all_results.txt http_results.txt https_results.txt socks5_results.txt socks4_results.txt; do
-              if [ -s "$f" ]; then
-                if [ -f "target_repo/$f" ]; then
-                  cat "$f" "target_repo/$f" | grep -v '^\s*$' | sort -u > "target_repo/${f}.tmp"
-                  mv "target_repo/${f}.tmp" "target_repo/$f"
-                else
-                  cp "$f" target_repo/
-                fi
-              fi
-            done
-
-            cd target_repo
-            git config --local user.email "github-actions[bot]@users.noreply.github.com"
-            git config --local user.name "github-actions[bot]"
-            git add *_results.txt
-            if ! git diff --staged --quiet; then
-              git commit -m "Auto-update multi-protocol proxy results (${{ steps.date.outputs.date }}) [skip ci]"
-              git pull --rebase origin beta 2>/dev/null || git pull --rebase origin main 2>/dev/null || true
-              git push origin HEAD
-              echo "[+] 成功将结果提交并推回到私有仓库！"
-            else
-              echo "[*] 代理列表无变更，跳过提交。"
-            fi
-            cd ..
-          else
-            echo "[*] 本地仓库模式：直接提交并推送到当前仓库..."
-            git config --local user.email "github-actions[bot]@users.noreply.github.com"
-            git config --local user.name "github-actions[bot]"
-            git add *_results.txt
-            if ! git diff --staged --quiet; then
-              CURRENT_BRANCH="${GITHUB_REF#refs/heads/}"
-              git commit -m "Auto-update multi-protocol proxy results (${{ steps.date.outputs.date }}) [skip ci]"
-              git pull --rebase origin "$CURRENT_BRANCH" 2>/dev/null || true
-              git push origin "$CURRENT_BRANCH" 2>/dev/null || true
-            else
-              echo "[*] 代理列表无变更，跳过提交。"
+            WORK_REPO="target_repo"
+            if [ -f "target_repo/multi_scan.go" ]; then
+              SCANNER_SRC="target_repo/multi_scan.go"
             fi
           fi
+
+          if [ "$OUTPUT_MODE" = "overwrite" ]; then
+            echo "[*] 选定保存模式: overwrite (覆盖最新) -> 仅保留本次扫描新结果，丢弃历史存活池"
+            cp temp_merge/new_alive.txt temp_merge/final_all.txt
+            FINAL_COUNT=$NEW_COUNT
+            echo "[*] 覆盖后当前总存活代理数: $FINAL_COUNT"
+          else
+            echo "[*] 选定保存模式: merge (合并去重) -> 正在对历史存活池保活复测并与新结果合并..."
+            # 对历史存活代理池进行快速保活复测，自动剔除失效死节点与历史假活
+            : > temp_merge/rechecked_old.txt
+            if [ -s "${WORK_REPO}/all_results.txt" ] && [ -f "$SCANNER_SRC" ]; then
+              OLD_COUNT=$(grep -v '^\s*$' "${WORK_REPO}/all_results.txt" 2>/dev/null | wc -l | tr -d ' ' || echo 0)
+              echo "[*] 检测到历史存活池共 ${OLD_COUNT} 条，正在执行保活复测..."
+              if go run "$SCANNER_SRC" \
+                -input "${WORK_REPO}/all_results.txt" \
+                -output "temp_merge/rechecked_old.txt" \
+                -recheck \
+                -silent \
+                -dict none \
+                -shuffle=false \
+                -workers 1000 \
+                -timeout "$TIMEOUT_CLEAN"; then
+                KEPT_COUNT=$(grep -v '^\s*$' temp_merge/rechecked_old.txt 2>/dev/null | wc -l | tr -d ' ' || echo 0)
+                echo "[*] 历史代理保活复测完成: 留存真活 ${KEPT_COUNT} / ${OLD_COUNT} 条"
+              else
+                echo "[!] 复测执行异常，安全回退保留原有历史列表"
+                cp "${WORK_REPO}/all_results.txt" temp_merge/rechecked_old.txt
+              fi
+            fi
+
+            # 合并【本次新发现】+【历史仍存活】并严格去重
+            cat temp_merge/new_alive.txt temp_merge/rechecked_old.txt | grep -v '^\s*$' | sort -u > temp_merge/final_all.txt || : > temp_merge/final_all.txt
+            FINAL_COUNT=$(wc -l < temp_merge/final_all.txt | tr -d ' ')
+            echo "[*] 合并去重后当前总存活代理数: $FINAL_COUNT"
+          fi
+
+          HTTP_COUNT=$(grep -c '^http://' temp_merge/final_all.txt || true)
+          HTTPS_COUNT=$(grep -c '^https://' temp_merge/final_all.txt || true)
+          SOCKS5_COUNT=$(grep -c '^socks5://' temp_merge/final_all.txt || true)
+          SOCKS4_COUNT=$(grep -c '^socks4://' temp_merge/final_all.txt || true)
+          META_MODE="$OUTPUT_MODE" META_NEW="${NEW_COUNT:-0}" META_OLD="${OLD_COUNT:-0}" META_KEPT="${KEPT_COUNT:-0}" META_FINAL="${FINAL_COUNT:-0}" META_REPO="$WORK_REPO" META_HTTP="${HTTP_COUNT:-0}" META_HTTPS="${HTTPS_COUNT:-0}" META_SOCKS5="${SOCKS5_COUNT:-0}" META_SOCKS4="${SOCKS4_COUNT:-0}" python3 - <<'EOF'
+          import json
+          import os
+
+          meta = {
+              "output_mode": os.getenv("META_MODE", "merge"),
+              "new_count": int(os.getenv("META_NEW", "0") or 0),
+              "old_count": int(os.getenv("META_OLD", "0") or 0),
+              "kept_count": int(os.getenv("META_KEPT", "0") or 0),
+              "final_count": int(os.getenv("META_FINAL", "0") or 0),
+              "work_repo": os.getenv("META_REPO", "."),
+              "http_count": int(os.getenv("META_HTTP", "0") or 0),
+              "https_count": int(os.getenv("META_HTTPS", "0") or 0),
+              "socks5_count": int(os.getenv("META_SOCKS5", "0") or 0),
+              "socks4_count": int(os.getenv("META_SOCKS4", "0") or 0),
+          }
+          with open("temp_merge/scan_meta.json", "w", encoding="utf-8") as f:
+              json.dump(meta, f)
+          EOF
+
+          if [ "$FINAL_COUNT" -eq 0 ]; then
+            echo "[!] 本次存活总数为 0，触发保护机制：保留原有结果文件不覆盖，跳过提交。"
+            exit 0
+          fi
+
+          # 统一按协议分流写入目标仓库，确保 5 个文件严格一致且无重复
+          cp temp_merge/final_all.txt "${WORK_REPO}/all_results.txt"
+          grep '^http://' temp_merge/final_all.txt > "${WORK_REPO}/http_results.txt" || : > "${WORK_REPO}/http_results.txt"
+          grep '^https://' temp_merge/final_all.txt > "${WORK_REPO}/https_results.txt" || : > "${WORK_REPO}/https_results.txt"
+          grep '^socks5://' temp_merge/final_all.txt > "${WORK_REPO}/socks5_results.txt" || : > "${WORK_REPO}/socks5_results.txt"
+          grep '^socks4://' temp_merge/final_all.txt > "${WORK_REPO}/socks4_results.txt" || : > "${WORK_REPO}/socks4_results.txt"
+
+          NOW_UTC=$(date -u +'%Y-%m-%d %H:%M:%S UTC')
+          cd "$WORK_REPO"
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add all_results.txt http_results.txt https_results.txt socks5_results.txt socks4_results.txt
+
+          if ! git diff --staged --quiet; then
+            if [ "$CROSS_REPO" = "true" ]; then
+              TARGET_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+            else
+              TARGET_BRANCH="${GITHUB_REF#refs/heads/}"
+            fi
+            git commit -m "Auto-update multi-protocol proxy results (${NOW_UTC}, alive: ${FINAL_COUNT}, mode: ${OUTPUT_MODE}) [skip ci]"
+            for attempt in 1 2 3; do
+              git pull --rebase origin "$TARGET_BRANCH" 2>/dev/null || true
+              if git push origin "$TARGET_BRANCH"; then
+                echo "[+] 成功更新并推送代理结果 (总存活: ${FINAL_COUNT})！"
+                break
+              fi
+              echo "[!] Push 遇到并发更新冲突，等待 ${attempt}s 后重试..."
+              sleep "$attempt"
+            done
+          else
+            echo "[*] 代理列表无变更，跳过提交。"
+          fi
+
+      - name: Sync Gist & Send Telegram Notification
+        if: needs.scan-matrix.result != 'cancelled' && needs.scan-matrix.result != 'skipped'
+        continue-on-error: true
+        env:
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+          GIST_ID: ${{ secrets.GIST_ID || vars.GIST_ID }}
+          RAW_PROTO: ${{ github.event.inputs.protocol || 'all' }}
+          RAW_DICT: ${{ github.event.inputs.dict_mode || 'fast' }}
+          SHARD_TOT: ${{ needs.generate-matrix.outputs.total_shards }}
+          IN_WORKERS: ${{ github.event.inputs.workers || '3000' }}
+          MATRIX_RESULT: ${{ needs.scan-matrix.result }}
+        run: |
+          python3 - <<'EOF'
+          import datetime
+          import html
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+
+          tg_token = os.getenv("TG_BOT_TOKEN", "").strip()
+          tg_chat = os.getenv("TG_CHAT_ID", "").strip()
+          gist_token = os.getenv("GIST_TOKEN", "").strip()
+          gist_id = os.getenv("GIST_ID", "").strip()
+          if "/" in gist_id:
+              gist_id = gist_id.rstrip("/").split("/")[-1]
+
+          if not tg_token and not gist_token:
+              print("[*] 未配置 Telegram 或 GitHub Gist 凭据，跳过推送通知。")
+              raise SystemExit(0)
+
+          meta_path = "temp_merge/scan_meta.json"
+          meta = {
+              "output_mode": "merge",
+              "new_count": 0,
+              "old_count": 0,
+              "kept_count": 0,
+              "final_count": 0,
+              "work_repo": ".",
+              "http_count": 0,
+              "https_count": 0,
+              "socks5_count": 0,
+              "socks4_count": 0,
+          }
+          if os.path.exists(meta_path):
+              try:
+                  with open(meta_path, "r", encoding="utf-8") as f:
+                      meta.update(json.load(f))
+              except Exception as e:
+                  print(f"[!] 读取汇总元数据失败: {e}")
+
+          final_count = int(meta.get("final_count", 0))
+          new_count = int(meta.get("new_count", 0))
+          old_count = int(meta.get("old_count", 0))
+          kept_count = int(meta.get("kept_count", 0))
+          output_mode = str(meta.get("output_mode", "merge"))
+          work_repo = str(meta.get("work_repo", "."))
+
+          gist_view_url = ""
+          gist_raw_url = ""
+          created_gist_id = ""
+
+          if gist_token:
+              if final_count == 0:
+                  print("[*] 本次有效存活代理为 0，自动跳过 Gist 同步 (保留历史备份数据)")
+              else:
+                  print("[*] 正在同步存活代理至 GitHub Secret Gist (多协议打包备份)...")
+                  result_names = [
+                      "all_results.txt",
+                      "http_results.txt",
+                      "https_results.txt",
+                      "socks5_results.txt",
+                      "socks4_results.txt",
+                  ]
+                  files_obj = {}
+                  empty_names = []
+                  for fname in result_names:
+                      fpath = os.path.join(work_repo, fname)
+                      content = ""
+                      if os.path.exists(fpath):
+                          with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                              content = f.read()
+                      if content.strip():
+                          files_obj[fname] = {"content": content}
+                      else:
+                          empty_names.append(fname)
+
+                  if not files_obj:
+                      files_obj["all_results.txt"] = {"content": "# ScamNet 暂无存活代理数据\n"}
+
+                  gh_headers = {
+                      "Authorization": f"Bearer {gist_token}",
+                      "Accept": "application/vnd.github+json",
+                      "User-Agent": "ScamNet-Scanner/1.0",
+                      "X-GitHub-Api-Version": "2022-11-28",
+                      "Content-Type": "application/json",
+                  }
+
+                  # overwrite 模式下，清理既有 Gist 中本次已为空的旧协议文件
+                  if gist_id and output_mode == "overwrite" and empty_names:
+                      try:
+                          get_req = urllib.request.Request(
+                              f"https://api.github.com/gists/{gist_id}",
+                              headers=gh_headers,
+                              method="GET",
+                          )
+                          with urllib.request.urlopen(get_req, timeout=10) as resp:
+                              existing = json.loads(resp.read().decode("utf-8", errors="ignore"))
+                              existing_files = existing.get("files", {}) or {}
+                              for ename in empty_names:
+                                  if ename in existing_files:
+                                      files_obj[ename] = None
+                      except Exception:
+                          pass
+
+                  now_str = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                  if gist_id:
+                      api_url = f"https://api.github.com/gists/{gist_id}"
+                      method = "PATCH"
+                      payload = {
+                          "description": f"ScamNet Live Proxies (Updated: {now_str})",
+                          "files": files_obj,
+                      }
+                  else:
+                      api_url = "https://api.github.com/gists"
+                      method = "POST"
+                      payload = {
+                          "description": f"ScamNet Live Proxies (Created: {now_str})",
+                          "public": False,
+                          "files": files_obj,
+                      }
+
+                  try:
+                      req = urllib.request.Request(
+                          api_url,
+                          data=json.dumps(payload).encode("utf-8"),
+                          headers=gh_headers,
+                          method=method,
+                      )
+                      with urllib.request.urlopen(req, timeout=15) as resp:
+                          res_obj = json.loads(resp.read().decode("utf-8", errors="ignore"))
+                          gist_view_url = res_obj.get("html_url", "") or ""
+                          res_files = res_obj.get("files", {}) or {}
+                          if "all_results.txt" in res_files:
+                              gist_raw_url = res_files["all_results.txt"].get("raw_url", "") or ""
+                          else:
+                              for fmeta in res_files.values():
+                                  gist_raw_url = (fmeta or {}).get("raw_url", "") or ""
+                                  if gist_raw_url:
+                                      break
+                          if not gist_id and res_obj.get("id"):
+                              created_gist_id = res_obj["id"]
+                          # 脱敏：不在公开 Runner 日志打印 Secret Gist 明文链接
+                          print("[+] GitHub Secret Gist 同步成功！")
+                  except urllib.error.HTTPError as e:
+                      err_body = e.read().decode("utf-8", errors="ignore")[:300]
+                      print(f"[!] Gist 同步失败: HTTP {e.code} {err_body}")
+                  except Exception as e:
+                      print(f"[!] Gist 同步异常: {e}")
+
+          if tg_token and tg_chat:
+              print("[*] 正在发送 Telegram 机器人通知卡片...")
+              proto_val = (os.getenv("RAW_PROTO", "all").split() or ["all"])[0]
+              dict_val = (os.getenv("RAW_DICT", "fast").split() or ["fast"])[0]
+              shards_val = os.getenv("SHARD_TOT", "1")
+              workers_val = "".join(c for c in os.getenv("IN_WORKERS", "3000") if c.isdigit()) or "3000"
+              matrix_res = os.getenv("MATRIX_RESULT", "success")
+
+              status_text = "✅ 云端扫描与汇总完成" if matrix_res == "success" else f"⚠️ 扫描结束 (矩阵状态: {html.escape(matrix_res)})"
+              mode_label = "merge (合并去重)" if output_mode == "merge" else "overwrite (覆盖最新)"
+
+              recheck_line = ""
+              if output_mode == "merge" and old_count > 0:
+                  recheck_line = f"\n♻️ <b>历史保活:</b> 留存 {kept_count} / {old_count} 条"
+
+              gist_section = ""
+              if gist_view_url:
+                  gist_section = (
+                      f'\n━━━━━━━━━━━━━━━━━━━\n🔗 <b>Gist 私密同步:</b> '
+                      f'<a href="{html.escape(gist_view_url)}">在线查看</a> | '
+                      f'<a href="{html.escape(gist_raw_url)}">Raw 直链</a>'
+                  )
+                  if created_gist_id:
+                      gist_section += (
+                          f'\n💡 <i>首次新建 Secret Gist，ID 为 <code>{html.escape(created_gist_id)}</code>'
+                          f'（可写入 Secret <code>GIST_ID</code> 以便后续覆盖更新）</i>'
+                      )
+              elif gist_token and final_count == 0:
+                  if gist_id:
+                      hist_url = f"https://gist.github.com/{gist_id}"
+                      gist_section = (
+                          f'\n━━━━━━━━━━━━━━━━━━━\n🔗 <b>Gist 备份:</b> '
+                          f'<a href="{html.escape(hist_url)}">历史备份</a> (本次无存活未覆盖)'
+                      )
+                  else:
+                      gist_section = "\n━━━━━━━━━━━━━━━━━━━\n🔗 <b>Gist 备份:</b> 本次无存活，已跳过推送"
+
+              msg = (
+                  f"🚀 <b>ScamNet 云端扫描任务报告</b>\n"
+                  f"━━━━━━━━━━━━━━━━━━━\n"
+                  f"📊 <b>任务状态:</b> {status_text}\n"
+                  f"💾 <b>保存模式:</b> {html.escape(mode_label)}\n"
+                  f"🎯 <b>本次新发现:</b> {new_count} 个 | <b>总存活代理:</b> {final_count} 个"
+                  f"{recheck_line}\n"
+                  f"📌 <b>协议分布:</b> HTTP: {meta.get('http_count', 0)} | HTTPS: {meta.get('https_count', 0)} | SOCKS5: {meta.get('socks5_count', 0)} | SOCKS4: {meta.get('socks4_count', 0)}\n"
+                  f"🖥 <b>矩阵分片:</b> {html.escape(shards_val)} 台机器 (并发: {html.escape(workers_val)} | 协议: {html.escape(proto_val)} | 字典: {html.escape(dict_val)})"
+                  f"{gist_section}"
+              )
+
+              tg_payload = json.dumps({
+                  "chat_id": tg_chat,
+                  "text": msg,
+                  "parse_mode": "HTML",
+                  "disable_web_page_preview": False,
+              }).encode("utf-8")
+
+              try:
+                  tg_req = urllib.request.Request(
+                      f"https://api.telegram.org/bot{tg_token}/sendMessage",
+                      data=tg_payload,
+                      headers={"Content-Type": "application/json"},
+                      method="POST",
+                  )
+                  with urllib.request.urlopen(tg_req, timeout=10) as resp:
+                      if 200 <= resp.status < 300:
+                          print("[+] Telegram 通知已成功发送！")
+              except urllib.error.HTTPError as e:
+                  err_body = e.read().decode("utf-8", errors="ignore")[:300]
+                  print(f"[!] Telegram 通知发送失败: HTTP {e.code} {err_body}")
+              except Exception as e:
+                  print(f"[!] Telegram 通知发送异常: {type(e).__name__}")
+          EOF
 
       - name: Destroy temporary artifacts and purge old runs
         if: always()
         env:
-          GH_TOKEN: ${{ secrets.MY_PAT || secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           echo "[*] 安全防泄露清理：正在彻底销毁本次运行产生的所有中转 Artifacts..."
           CURRENT_RUN_ID="${{ github.run_id }}"
